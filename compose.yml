@@ -149,7 +149,6 @@ services:
       - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
       - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=True
-      # Pass connection info so DAGs can reach other services
       - KAFKA_BOOTSTRAP=kafka:9092
       - CONNECT_URL=http://connect:8083
       - PG_HOST=postgres
@@ -157,20 +156,23 @@ services:
       - PG_DB=sourcedb
       - PG_USER=${PG_USER:-cdc_user}
       - PG_PASSWORD=${PG_PASSWORD:-cdc_pass}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - HOST_PROJECT_DIR=${PWD}
+      - COMPOSE_NETWORK=bigdata-project-3_default
+      - SPARK_IMAGE=${SPARK_IMAGE:-quay.io/jupyter/pyspark-notebook:2025-12-31}
     volumes:
       - ./dags:/opt/airflow/dags
       - airflow-data:/opt/airflow
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: root
     entrypoint: >
       /bin/bash -c "
-        airflow db migrate;
-        airflow users create
-          --username ${AIRFLOW_USER:-admin}
-          --password ${AIRFLOW_PASSWORD:-admin}
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email admin@example.com 2>/dev/null || true;
-        exec airflow standalone
+        chmod 666 /var/run/docker.sock &&
+        sudo -E -u airflow pip install -q apache-airflow-providers-docker &&
+        sudo -E -u airflow airflow db migrate &&
+        sudo -E -u airflow airflow users create --username ${AIRFLOW_USER:-admin} --password ${AIRFLOW_PASSWORD:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com 2>/dev/null || true &&
+        exec sudo -E -u airflow airflow standalone
       "
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
@@ -178,19 +180,33 @@ services:
       timeout: 10s
       retries: 10
 
+  # ── One-shot: fix ivy-cache volume ownership so jovyan (uid 1000) can write ──
+  ivy-init:
+    image: alpine:3.21
+    volumes:
+      - ivy-cache:/mnt
+    command: ["/bin/sh", "-c", "mkdir -p /mnt/cache /mnt/jars && chown -R 1000:100 /mnt"]
+    restart: "no"
+
   # ── Jupyter + PySpark ────────────────────────────────────────────────────────
   jupyter:
     image: quay.io/jupyter/pyspark-notebook:2025-12-31
     container_name: jupyter
     depends_on:
-      - kafka
-      - postgres
-      - iceberg-rest
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_started
+      ivy-init:
+        condition: service_completed_successfully
     ports:
       - "8888:8888"
       - "4040:4040"
     volumes:
       - ./:/home/jovyan/project
+      - ivy-cache:/home/jovyan/.ivy2
     environment:
       - JUPYTER_TOKEN=${JUPYTER_TOKEN}
       - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
@@ -216,3 +232,4 @@ volumes:
   pg-data:
   minio-data:
   airflow-data:
+  ivy-cache:
