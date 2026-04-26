@@ -30,6 +30,7 @@ _SPARK_ENV = {
     "PG_DB":                os.environ.get("PG_DB", "sourcedb"),
     "PG_USER":              os.environ.get("PG_USER", "cdc_user"),
     "PG_PASSWORD":          os.environ.get("PG_PASSWORD", "cdc_pass"),
+    "AWS_REGION":           "us-east-1",
 }
 
 

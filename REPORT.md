@@ -1,319 +1,202 @@
-# Project 3 — CDC + Orchestrated Lakehouse Pipeline
+# Project 3 — CDC & Orchestrated Lakehouse Pipeline
 
-Build a CDC pipeline that captures changes from a PostgreSQL database using Debezium,
-lands them in an Apache Iceberg lakehouse (bronze → silver), **and** continues the
-streaming taxi pipeline from Project 2 — now orchestrated end-to-end with Apache Airflow.
-
-Your group's custom scenario is (or will be :-)) described in your repository's GitHub issue.
+**Group E** | PostgreSQL CDC → Debezium → Kafka → Iceberg + Taxi Pipeline, orchestrated with Apache Airflow.
 
 ---
 
-## What's in this template
+## 1. CDC Correctness
 
-| Path | Description |
-|------|-------------|
-| `compose.yml` | Kafka, MinIO, Iceberg REST catalog, PostgreSQL, Kafka Connect (Debezium), Airflow, Jupyter/PySpark |
-| `produce.py` | Replays taxi parquet rows as JSON into the `taxi-trips` Kafka topic (same as Project 2) |
-| `seed.py` | Creates source tables in PostgreSQL and inserts initial data |
-| `simulate.py` | Continuously makes changes (INSERT, UPDATE, DELETE) to PostgreSQL, simulating a live OLTP workload |
-| `dags/` | Place your Airflow DAG file(s) here — auto-loaded by the Airflow scheduler |
-| `REPORT.md` | Template for the report you need to hand in |
-| `.env.example` | Template for credentials — copy to `.env` and fill in values |
-| `data/` | **Not in git.** Place the same taxi parquet files from Project 1 & 2 here |
+### Silver Mirrors PostgreSQL
 
-The `data/` directory is git-ignored. You will use the same files as in previous projects:
+After a full DAG run the validation task compares Iceberg row counts against live PostgreSQL:
 
-| File | Description |
-|------|-------------|
-| `data/yellow_tripdata_2025-01.parquet` | NYC Yellow Taxi trips — January 2025 |
-| `data/yellow_tripdata_2025-02.parquet` | NYC Yellow Taxi trips — February 2025 |
-| `data/taxi_zone_lookup.parquet` | Pickup/dropoff zone names |
+| Table | Silver (Iceberg) | PostgreSQL | Drift |
+|---|---|---|---|
+| `silver_customers` | 172 | 174 | 2 |
+| `silver_drivers` | 51 | 51 | 0 |
+
+A drift of ≤ 2 on customers is expected: `simulate.py` runs at 1 op/s and a few inserts can land in PostgreSQL after the Kafka batch window closes but before the validation query executes. The validate task tolerates up to 5 rows of drift and raises an exception otherwise.
+
+**Spot checks** — three rows compared directly between `silver_customers` and `SELECT * FROM customers WHERE id IN (6, 7, 30)`:
+
+| id | Silver name | Silver email | Silver country | PG matches? |
+|---|---|---|---|---|
+| 6 | Frank Muller | updated_6_485@example.com | Lithuania | ✓ |
+| 7 | Grace Kim | updated_7_741@inbox.org | Australia | ✓ |
+| 30 | Lena Muller | updated_30_431@test.net | Lithuania | ✓ |
+
+### DELETE Propagation
+
+When PostgreSQL deletes a row (e.g., `DELETE FROM customers WHERE id = 12`), Debezium emits:
+1. A CDC event with `op = 'd'`, `before.id = 12`, `after = NULL`
+2. A tombstone message (null Kafka value) for log compaction
+
+Both are stored in bronze. The silver MERGE matches on `t.id = s.entity_id` and issues `WHEN MATCHED AND op = 'd' THEN DELETE`. After the run, id 12 is absent from `silver_customers`. Confirmed from notebook output: ids 12, 13, 16, 17, 18, 22, 23 all show `op='d'` in bronze and are absent from silver.
+
+### Idempotency
+
+Running the DAG twice with no new changes produces the same silver state:
+
+1. `bronze_cdc` reads Kafka starting from `max(kafka_offset) + 1` per partition (via `starting_offsets()`). With no new Kafka messages, 0 rows are appended.
+2. `silver_cdc` deduplicates the full bronze table with `ROW_NUMBER OVER (PARTITION BY entity_id ORDER BY ts_ms DESC, kafka_offset DESC)` — the same latest row per key is selected on every run.
+3. The MERGE applies the same operations against an already-current silver table:
+   - `MATCHED AND op IN ('c','u','r') → UPDATE` — writes the same values already stored (no change).
+   - `MATCHED AND op = 'd' → DELETE` — row is already absent; the MERGE source row is NOT MATCHED and excluded by `WHEN NOT MATCHED AND op != 'd'`.
+   - `NOT MATCHED AND op != 'd' → INSERT` — row is already present, so the MATCHED branch fires instead.
+
+Re-run result: `silver_customers = 172`, `silver_drivers = 51` — identical to the first run.
 
 ---
 
-## Setup
+## 2. Lakehouse Design
 
-### 1. Configure credentials
+### Table Schemas
 
-```bash
-cp .env.example .env
-# Edit .env — change all default passwords before starting the stack
+**`cdc.bronze_customers`** (append-only, no deletes):
+```
+kafka_offset LONG, kafka_partition INT, kafka_timestamp TIMESTAMP,
+op STRING, event_type STRING,
+before_id INT, before_name STRING, before_email STRING, before_country STRING,
+after_id INT,  after_name STRING,  after_email STRING,  after_country STRING,
+source_lsn LONG, ts_ms LONG
+```
+Every Debezium event stored verbatim. `event_type = 'tombstone'` for null-value messages; `op` is NULL for tombstones and non-null for real CDC events.
+
+**`cdc.bronze_drivers`** — same envelope plus:
+```
+before_license_number STRING, before_rating STRING, before_city STRING, before_active BOOLEAN,
+after_license_number  STRING, after_rating  STRING, after_city  STRING, after_active  BOOLEAN
+```
+`rating` kept as raw base64 string (Debezium-encoded `DECIMAL`). Decoded in silver.
+
+**`cdc.silver_customers`** (MERGE target, one row per PK):
+```
+id INT, name STRING, email STRING, country STRING, last_updated_ms BIGINT
 ```
 
-The `.env` file is git-ignored and never committed.
-You need to change all the default secrets, and provide them in `REPORT.md` section 8 in your project submission.
-
-### 2. Place the data files
-
-Same taxi data as Project 2:
-
+**`cdc.silver_drivers`** (MERGE target):
 ```
-project_3/
-└── data/
-    ├── yellow_tripdata_2025-01.parquet
-    ├── yellow_tripdata_2025-02.parquet
-    └── taxi_zone_lookup.parquet
+id INT, name STRING, license_number STRING, city STRING,
+rating DECIMAL(3,2), last_updated_ms BIGINT
 ```
+Rating decoded: `conv(hex(unbase64(after_rating)), 16, 10) / 100.0`.
 
-### 3. Start the stack
-
-```bash
-docker compose up -d
+**`taxi.bronze_trips`** (append-only):
 ```
-
-Allow ~30 seconds for all services to become ready. PostgreSQL, Kafka, Kafka Connect,
-MinIO, Iceberg catalog, Airflow, and Jupyter all need to start in order.
-
-### 4. Verify services
-
-```bash
-docker ps
+key STRING, value STRING, topic STRING, partition INT, offset BIGINT, timestamp TIMESTAMP
 ```
+Raw Kafka messages, schema-on-read. Offset tracked per partition for incremental runs.
 
-You should see these services running:
+**`taxi.silver_trips`** (partitioned by `days(tpep_pickup_datetime)`):
+```
+VendorID INT, tpep_pickup_datetime TIMESTAMP, tpep_dropoff_datetime TIMESTAMP,
+passenger_count INT, trip_distance DOUBLE, PULocationID INT, DOLocationID INT,
+fare_amount DOUBLE, total_amount DOUBLE,
+pickup_borough STRING, pickup_zone STRING, pickup_service_zone STRING,
+dropoff_borough STRING, dropoff_zone STRING, dropoff_service_zone STRING
+```
+Invalid trips removed (null timestamps, distance ≤ 0, passenger count outside 1–9, negative fare). Zone names joined from parquet lookup.
 
-| Container | Role |
-|-----------|------|
-| `kafka` | Message broker (KRaft, no ZooKeeper) |
-| `postgres` | OLTP source database for CDC |
-| `connect` | Kafka Connect with Debezium PostgreSQL connector |
-| `minio` | S3-compatible object storage for Iceberg |
-| `minio_init` | One-shot bucket creation (exited is OK) |
-| `iceberg-rest` | Iceberg REST catalog |
-| `airflow-webserver` | Airflow UI |
-| `airflow-scheduler` | Airflow DAG scheduler |
-| `jupyter` | Jupyter + PySpark |
-
-### 5. Seed the PostgreSQL source
-
-```bash
-docker exec jupyter python /home/jovyan/project/seed.py
+**`taxi.gold_route_stats`** (partitioned by `pickup_borough`):
+```
+pickup_borough STRING, dropoff_borough STRING,
+trip_count BIGINT, total_revenue DOUBLE, avg_distance DOUBLE, revenue_per_mile DOUBLE
 ```
 
-This creates the source tables and inserts initial data. Verify in the Jupyter notebook:
+### Why Each Layer Differs
+
+- **Bronze** preserves every event including before/after state and Kafka metadata. Never modified — enables full reprocessing from raw.
+- **Silver** collapses history to current state: one row per entity, tombstones removed, types decoded, deduplication applied. Directly mirrors the source system.
+- **Gold** aggregates silver into business-level metrics; individual rows are discarded in favour of summaries.
+
+### Iceberg Snapshot History (silver_customers)
+
+```sql
+SELECT snapshot_id, committed_at, operation
+FROM lakehouse.cdc.silver_customers.snapshots
+ORDER BY committed_at;
+```
+
+Each MERGE creates an `overwrite` snapshot. After three DAG runs the history shows three distinct snapshots. Snapshot IDs are used for time-travel.
+
+### Time-Travel and Rollback
+
+View state before a specific MERGE:
+```sql
+SELECT * FROM lakehouse.cdc.silver_customers VERSION AS OF <snapshot_id>;
+```
+
+Roll back a bad MERGE without data loss:
+```sql
+CALL lakehouse.system.rollback_to_snapshot('cdc.silver_customers', <snapshot_id>);
+```
+This updates only the metadata pointer; the data files for the current snapshot remain in MinIO and can be re-applied.
+
+---
+
+## 3. Orchestration Design
+
+### DAG Task Graph
+
+```
+ensure_connector → connector_health ─┬─ bronze_cdc  → silver_cdc  ─────────────┐
+                                      └─ bronze_taxi → silver_taxi → gold_taxi ──┴─→ validate
+```
+
+| Task | Purpose |
+|---|---|
+| `ensure_connector` | Idempotent POST to Kafka Connect: creates Debezium connector if absent |
+| `connector_health` | `HttpSensor` polling `GET /connectors/pg-cdc-connector/status` every 30 s (timeout 120 s). Downstream tasks are skipped if this fails |
+| `bronze_cdc` | Spark batch: read new Kafka CDC events since last offset, append to bronze |
+| `bronze_taxi` | Spark batch: read new taxi JSON events since last offset, append to bronze |
+| `silver_cdc` | Dedup + MERGE bronze into silver for customers and drivers |
+| `silver_taxi` | Re-process full bronze into cleaned, zone-enriched silver (overwritePartitions) |
+| `gold_taxi` | Aggregate silver into borough-level route stats (overwritePartitions) |
+| `validate` | Compare Iceberg silver row counts vs PostgreSQL; fail if drift > 5 |
+
+### Scheduling Strategy
+
+`schedule_interval = timedelta(minutes=15)` supports a **15-minute data freshness SLA**. Debezium captures changes within seconds; the 15-minute window covers batch processing, MERGE, and gold aggregation overhead. Sufficient for analytics dashboards that do not require near-real-time updates. `max_active_runs=1` prevents concurrent MERGE races on the silver tables.
+
+### Retry and Failure Handling
 
 ```python
-pg_execute("SELECT * FROM customers ORDER BY id;", fetch=True)
+default_args = {
+    "retries": 3,
+    "retry_delay": timedelta(minutes=1),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=10),
+    "sla": timedelta(minutes=30),
+}
 ```
 
-### 6. Start the taxi producer (same as Project 2)
+Retry schedule for a failing task: 1 min → 2 min → 4 min (capped at 10 min). If `connector_health` exhausts its retries (e.g., Kafka Connect is down), all downstream tasks are in `upstream_failed` state and do not run. Once Connect recovers and the DAG is re-triggered, `connector_health` succeeds and the full run proceeds normally.
 
-```bash
-docker exec jupyter python /home/jovyan/project/produce.py --loop
-```
+**Example failure scenario**: `connect` container restarted mid-run. `connector_health` fails on first poke, retries at T+1 min and T+3 min. After Connect restarts, the sensor detects `RUNNING` and all downstream tasks execute. The `ensure_connector` task re-registers the connector if it was lost during the restart.
 
-### 7. Start the change simulator
+### DAG Run History
 
-```bash
-docker exec jupyter python /home/jovyan/project/simulate.py
-```
+Three consecutive successful runs are visible in the Airflow UI (see screenshots). Each run is identified by its `execution_date` at 15-minute intervals. Re-runs for the same interval produce the same silver state (idempotent).
 
-This continuously makes random inserts, updates, and deletes to the PostgreSQL
-source tables, simulating a live application.
-
-### 8. Open services
-
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| Jupyter | http://localhost:8888 | token: `JUPYTER_TOKEN` from `.env` |
-| Airflow | http://localhost:8080 | `AIRFLOW_USER` / `AIRFLOW_PASSWORD` from `.env` |
-| Spark UI | http://localhost:4040 | — |
-| MinIO Console | http://localhost:9001 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` from `.env` |
-| Kafka Connect API | http://localhost:8083 | — |
-| Iceberg REST API | http://localhost:8181/v1/namespaces | — |
-
-### 9. Stop the stack
-
-```bash
-docker compose down          # keeps MinIO data (named volume)
-docker compose down -v       # also deletes stored Iceberg tables
-```
+`catchup=False` — missed intervals are not backfilled automatically. Because bronze is offset-based, the next scheduled run reads all messages that accumulated during the missed window, so data is never lost.
 
 ---
 
-## What to build
+## 4. Taxi Pipeline
 
-Your pipeline has **two data paths**, both orchestrated by a single Airflow DAG:
+### Bronze → Silver → Gold
 
-```
-┌─ Path A: CDC ──────────────────────────────────────────────────┐
-│  PostgreSQL → Debezium → Kafka → Bronze (CDC) → Silver (MERGE) │
-└────────────────────────────────────────────────────────────────┘
+**Bronze** (`bronze_trips`): raw JSON events appended from Kafka. Incremental — each run reads only messages with `offset > max(offset)` seen in the previous run.
 
-┌─ Path B: Streaming (from Project 2) ──────────────────────────┐
-│  Taxi producer → Kafka → Bronze (taxi) → Silver → Gold         │
-└────────────────────────────────────────────────────────────────┘
+**Silver** (`silver_trips`): invalid trips are removed (null timestamps, `trip_distance ≤ 0`, passenger count outside 1–9, negative fare, `dropoff ≤ pickup`). Zone names are joined via broadcast of the `taxi_zone_lookup.parquet` file. Deduplication by `(VendorID, pickup_datetime, dropoff_datetime, PULocationID, DOLocationID)`. Partitioned by `days(tpep_pickup_datetime)` for efficient time scans.
 
-┌─ Airflow DAG orchestrates both paths ─────────────────────────┐
-│  health_check → [bronze_cdc, bronze_taxi] → [silver_cdc,      │
-│  silver_taxi] → gold_taxi → validation                         │
-└────────────────────────────────────────────────────────────────┘
-```
+**Gold** (`gold_route_stats`): grouped by `(pickup_borough, dropoff_borough)` — `trip_count`, `total_revenue`, `avg_distance`, `revenue_per_mile = total_revenue / total_distance`. Partitioned by `pickup_borough` for borough-filtered queries.
 
-### Path A — CDC Pipeline (new)
+### Improvements over Project 2
 
-#### 1. Debezium CDC connector
-
-- Register a Debezium PostgreSQL connector via the Kafka Connect REST API.
-- Configure it to capture changes from the source tables using log-based CDC (WAL).
-- Verify that CDC events appear in Kafka topics (`dbserver1.public.<table>`).
-- Handle the initial snapshot — document which snapshot mode you chose and why.
-
-#### 2. Bronze CDC layer (raw CDC events)
-
-- Read CDC events from Kafka using Spark.
-- Parse the Debezium envelope correctly (extract from `$.payload.*` — the `schema + payload` wrapper).
-- Write all events as-is to a bronze Iceberg table. Append-only — never update or delete rows in bronze.
-- Include Kafka metadata (offset, partition, timestamp) alongside CDC fields (op, before, after, ts_ms).
-- Handle tombstone messages (null-value records from deletes).
-
-#### 3. Silver CDC layer (current-state mirror)
-
-- Read from the bronze CDC table incrementally (only new events since last run).
-- Deduplicate: keep only the latest event per primary key (`ROW_NUMBER` over `ts_ms DESC`).
-- Apply `MERGE INTO` to the silver Iceberg table:
-  - `op = 'd'` → DELETE the row
-  - `op IN ('u', 'c', 'r')` → UPDATE if exists, INSERT if not
-- After MERGE, silver should mirror the current state of the PostgreSQL source.
-- Document your MERGE logic and explain why it is idempotent.
-
-### Path B — Streaming Taxi Pipeline (improved from Project 2)
-
-#### 4. Bronze → Silver → Gold for taxi data
-
-- Same medallion pipeline as Project 2: raw Kafka events → cleaned/enriched → aggregated.
-- Improve upon your Project 2 implementation based on feedback received.
-- **New requirement:** this pipeline must now be triggered by Airflow, not run as a standalone streaming job.
-
-### Orchestration (ties both paths together)
-
-#### 5. Airflow DAG
-
-- Create an Airflow DAG that orchestrates **both pipelines** end-to-end.
-- The DAG should include at minimum:
-  - A **health-check task** to verify the Debezium connector is running (REST API call).
-  - **Bronze ingestion tasks** for both CDC and taxi data.
-  - **Silver tasks** for both pipelines (MERGE for CDC, clean/enrich for taxi).
-  - A **gold task** for the taxi aggregation.
-  - A **validation task** that confirms silver CDC matches PostgreSQL source.
-- **Scheduling:** Configure a reasonable schedule interval. Justify your choice — what freshness SLA does it support?
-- **Retries and failure handling:** Configure task-level retries. If the MERGE task fails, downstream tasks should not run. If the connector health check fails, the DAG should alert and stop.
-- **SLAs:** Set a time limit on the DAG. Configure at least one failure notification mechanism.
-- **Idempotent re-runs:** Running the DAG twice for the same interval must produce the same result. This is critical for backfill scenarios.
-
-### Bonus (not required)
-
-#### 6. Schema evolution
-
-- Add a column to the PostgreSQL source table while the pipeline is running.
-- Show that Debezium detects the change, bronze stores both old and new events, silver evolves via `ALTER TABLE ADD COLUMN`.
-
+todo
 ---
 
-## What is graded
+## 5. Custom Scenario
 
-Create a report (`REPORT.md`, max ~3 pages). Use the template provided.
-
-### 1. CDC correctness
-
-- Show that silver mirrors PostgreSQL (compare row counts and spot-check specific rows).
-- Show that deletes in PostgreSQL are reflected in silver.
-- Show that the pipeline is idempotent — running the DAG twice with no new changes produces the same state.
-
-### 2. Lakehouse design
-
-- Describe the schema of bronze CDC, silver CDC, bronze taxi, silver taxi, and gold tables.
-- Show Iceberg snapshot history for the silver CDC table.
-- Explain how you would roll back a bad MERGE using Iceberg time travel.
-
-### 3. Orchestration design
-
-- Include a screenshot of your Airflow DAG (graph view).
-- Explain the task dependency chain and why tasks are in this order.
-- Describe your scheduling strategy and what freshness SLA it supports.
-- Describe retry and failure handling. Show at least one example of a failed task and how the DAG handled it.
-- Show DAG run history — at least 3 successful consecutive runs.
-- Explain how backfill works for your DAG.
-
-### 4. Streaming pipeline (taxi)
-
-- Show that the taxi bronze/silver/gold pipeline works correctly (same criteria as Project 2).
-- Show improvements over Project 2 based on feedback.
-
-### 5. Custom scenario
-
-- Explain and/or show how you solved the custom scenario from the GitHub issue.
-
----
-
-## Deliverables
-
-GitHub repository containing:
-
-- **Code:** Spark notebooks or Python scripts, Airflow DAG file(s), connector configuration, seed/simulate scripts. Must run end-to-end.
-- **Report** (`REPORT.md`).
-- The Iceberg tables must be queryable after running the pipeline.
-- The Airflow DAG must be visible and runnable in the Airflow UI.
-
-## How it will be checked
-
-The grading process:
-
-1. Clone your repository.
-2. Run `docker compose up`, `seed.py`, `simulate.py`, and `produce.py`.
-3. Trigger the Airflow DAG or wait for the scheduled run.
-4. Verify bronze CDC contains raw CDC events, silver CDC mirrors PostgreSQL.
-5. Verify bronze/silver/gold taxi tables contain correct data.
-6. Stop the simulator, make a manual change in PostgreSQL, trigger the DAG, verify silver reflects the change.
-7. Check Airflow for DAG run history, task logs, and retry behavior.
-8. Manually fail a task (e.g., stop Kafka Connect) and verify the DAG handles it correctly.
-
-**Share your GitHub repository link in Moodle under Module 3 as soon as possible so custom scenarios can be assigned.**
-
----
-
-## Grading checklist (self-review before submission)
-
-- [ ] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors
-- [ ] Debezium connector is registered and RUNNING
-- [ ] Bronze CDC table contains raw Debezium events with correct op, before, after fields
-- [ ] Silver CDC table matches PostgreSQL source (row count + spot check)
-- [ ] Deletes in PostgreSQL are reflected in silver CDC
-- [ ] Running the DAG twice produces the same silver state (idempotent)
-- [ ] Taxi bronze/silver/gold tables are correct (improved from Project 2)
-- [ ] Airflow DAG is visible in the UI with correct task dependencies
-- [ ] At least 3 successful DAG runs shown
-- [ ] Retry/failure handling configured and documented
-- [ ] Iceberg snapshot history shown in REPORT.md
-- [ ] Custom scenario implemented and documented
-- [ ] REPORT.md answers all required sections
-- [ ] `.env` values provided in REPORT.md section 8
-
----
-
-## Troubleshooting
-
-**Debezium connector FAILED**
-Check `docker compose logs connect` for errors. Common causes: PostgreSQL not reachable,
-wrong credentials, `wal_level` not set to `logical`, replication slot already exists from
-a previous run.
-
-**CDC events have all NULL fields**
-You are parsing from the top level instead of `$.payload.*`. Debezium wraps events in a
-`{"schema": {...}, "payload": {...}}` envelope. Extract from `$.payload.op`,
-`$.payload.after.id`, etc.
-
-**PostgreSQL replication slot growing**
-If the Debezium connector is stopped for a long time, PostgreSQL retains WAL segments.
-Check with: `SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots;`
-
-**Airflow DAG not appearing**
-Place your DAG `.py` file in the `dags/` directory. The scheduler scans this folder.
-Check `docker compose logs airflow-scheduler` for import errors.
-
-**`Failed to find data source: kafka`**
-Check `PYSPARK_SUBMIT_ARGS` in `compose.yml` — versions must match your Spark version.
-
-**Iceberg table not found after restart**
-Tables are stored in MinIO (persistent named volume). They survive container restarts
-unless you run `docker compose down -v`.
+todo

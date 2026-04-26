@@ -41,6 +41,7 @@ def silver_cdc(**ctx):
             .drop("rn")
         )
 
+        deduped_cust = spark.createDataFrame(deduped_cust.collect(), deduped_cust.schema)
         deduped_cust.createOrReplaceTempView("cdc_batch")
         spark.sql("""
             MERGE INTO lakehouse.cdc.silver_customers AS t
@@ -89,6 +90,7 @@ def silver_cdc(**ctx):
             .drop("rn")
         )
 
+        deduped_drv = spark.createDataFrame(deduped_drv.collect(), deduped_drv.schema)
         deduped_drv.createOrReplaceTempView("cdc_drivers_batch")
         spark.sql("""
             MERGE INTO lakehouse.cdc.silver_drivers AS t
