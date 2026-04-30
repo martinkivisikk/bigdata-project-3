@@ -17,7 +17,7 @@ from tasks.cdc.connector import ensure_connector
 # ---------------------------------------------------------------------------
 _SPARK_IMAGE = os.environ.get("SPARK_IMAGE", "quay.io/jupyter/pyspark-notebook:2025-12-31")
 # Use the exact Windows path you saw in PowerShell
-_HOST_PROJECT_DIR = r"C:\Users\joona\ylikool\magister\teine\BDM\bigdata-project-3"
+_HOST_PROJECT_DIR = os.environ.get("HOST_PROJECT_DIR", "")
 _COMPOSE_NETWORK = os.environ.get("COMPOSE_NETWORK", "bigdata-project-3_default")
 _IVY_VOLUME = "bigdata-project-3_ivy-cache"
 
