@@ -48,5 +48,5 @@ SPARK_PACKAGES = ",".join([
 ])
 
 ZONE_LOOKUP_PATH = os.environ.get(
-    "ZONE_LOOKUP_PATH", "/home/jovyan/project/dags/taxi_zone_lookup.parquet"
+    "ZONE_LOOKUP_PATH", "/home/jovyan/project/data/taxi_zone_lookup.parquet"
 )
