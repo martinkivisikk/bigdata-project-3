@@ -16,7 +16,8 @@ from tasks.cdc.connector import ensure_connector
 # DockerOperator configuration — all Spark tasks run inside the Jupyter image
 # ---------------------------------------------------------------------------
 _SPARK_IMAGE = os.environ.get("SPARK_IMAGE", "quay.io/jupyter/pyspark-notebook:2025-12-31")
-_HOST_PROJECT_DIR = os.environ.get("HOST_PROJECT_DIR", "")
+# Use the exact Windows path you saw in PowerShell
+_HOST_PROJECT_DIR = r"C:\Users\joona\ylikool\magister\teine\BDM\bigdata-project-3"
 _COMPOSE_NETWORK = os.environ.get("COMPOSE_NETWORK", "bigdata-project-3_default")
 _IVY_VOLUME = "bigdata-project-3_ivy-cache"
 
@@ -151,4 +152,3 @@ with DAG(
     
     # 5. Final Validation: Wait for CDC Silver and both Taxi Gold tables
     [t_silver_cdc, t_gold_taxi, t_gold_anomalies] >> t_validate
-    
