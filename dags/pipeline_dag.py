@@ -16,6 +16,7 @@ from tasks.cdc.connector import ensure_connector
 # DockerOperator configuration — all Spark tasks run inside the Jupyter image
 # ---------------------------------------------------------------------------
 _SPARK_IMAGE = os.environ.get("SPARK_IMAGE", "quay.io/jupyter/pyspark-notebook:2025-12-31")
+# Use the exact Windows path you saw in PowerShell
 _HOST_PROJECT_DIR = os.environ.get("HOST_PROJECT_DIR", "")
 _COMPOSE_NETWORK = os.environ.get("COMPOSE_NETWORK", "bigdata-project-3_default")
 _IVY_VOLUME = "bigdata-project-3_ivy-cache"
@@ -102,6 +103,7 @@ with DAG(
     tags=["lakehouse", "cdc", "taxi"],
 ) as dag:
 
+    # --- Infrastructure Tasks ---
     t_ensure_connector = PythonOperator(
         task_id="ensure_connector",
         python_callable=ensure_connector,
@@ -116,17 +118,37 @@ with DAG(
         timeout=120,
     )
 
+    # --- Bronze Tasks ---
     t_bronze_cdc  = _spark_task("bronze_cdc",  "tasks.cdc.bronze",  "bronze_cdc")
     t_bronze_taxi = _spark_task("bronze_taxi", "tasks.taxi.bronze", "bronze_taxi")
+
+    # --- Silver Tasks ---
     t_silver_cdc  = _spark_task("silver_cdc",  "tasks.cdc.silver",  "silver_cdc")
     t_silver_taxi = _spark_task("silver_taxi", "tasks.taxi.silver", "silver_taxi")
-    t_gold_taxi   = _spark_task("gold_taxi",   "tasks.taxi.gold",   "gold_taxi")
-    t_validate    = _spark_task("validate",    "tasks.cdc.validate", "validate")
 
-    # Task graph:
-    # ensure_connector ──> connector_health ──┬──> bronze_cdc ──> silver_cdc ─────────────────┐
-    #                                         └──> bronze_taxi ──> silver_taxi ──> gold_taxi ──┘──> validate
-    t_ensure_connector >> connector_health >> [t_bronze_cdc, t_bronze_taxi]
+    # --- Gold Tasks ---
+    t_gold_taxi      = _spark_task("gold_taxi",      "tasks.taxi.gold",           "gold_taxi")
+    t_gold_anomalies = _spark_task("gold_anomalies", "tasks.taxi.gold_anomalies", "gold_taxi_anomalies")
+
+    # --- Validation ---
+    t_validate = _spark_task("validate", "tasks.cdc.validate", "validate")
+
+    # ---------------------------------------------------------------------------
+    # Task Graph Logic
+    # ---------------------------------------------------------------------------
+    
+    # 1. Start with Infrastructure
+    t_ensure_connector >> connector_health
+    
+    # 2. Fan out to Bronze ingestion after health check
+    connector_health >> [t_bronze_cdc, t_bronze_taxi]
+    
+    # 3. CDC Pipeline: Bronze -> Silver
     t_bronze_cdc >> t_silver_cdc
-    t_bronze_taxi >> t_silver_taxi >> t_gold_taxi
-    [t_silver_cdc, t_gold_taxi] >> t_validate
+    
+    # 4. Taxi Pipeline: Bronze -> Silver -> Gold (Stats & Anomalies in parallel)
+    t_bronze_taxi >> t_silver_taxi
+    t_silver_taxi >> [t_gold_taxi, t_gold_anomalies]
+    
+    # 5. Final Validation: Wait for CDC Silver and both Taxi Gold tables
+    [t_silver_cdc, t_gold_taxi, t_gold_anomalies] >> t_validate

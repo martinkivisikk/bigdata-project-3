@@ -27,6 +27,7 @@ def silver_taxi(**ctx):
                 PULocationID          INT,
                 DOLocationID          INT,
                 fare_amount           DOUBLE,
+                tip_amount            DOUBLE,
                 total_amount          DOUBLE,
                 pickup_borough        STRING,
                 pickup_zone           STRING,
@@ -38,6 +39,11 @@ def silver_taxi(**ctx):
             PARTITIONED BY (days(tpep_pickup_datetime))
         """)
 
+        try:
+            spark.sql("ALTER TABLE lakehouse.taxi.silver_trips ADD COLUMNS (tip_amount DOUBLE)")
+        except Exception:
+            pass  # column already present
+
         schema = StructType([
             StructField("VendorID",              IntegerType()),
             StructField("tpep_pickup_datetime",  TimestampType()),
@@ -47,6 +53,7 @@ def silver_taxi(**ctx):
             StructField("PULocationID",          IntegerType()),
             StructField("DOLocationID",          IntegerType()),
             StructField("fare_amount",           DoubleType()),
+            StructField("tip_amount",            DoubleType()),
             StructField("total_amount",          DoubleType()),
         ])
 
@@ -73,6 +80,7 @@ def silver_taxi(**ctx):
                 F.col("PULocationID").cast("int"),
                 F.col("DOLocationID").cast("int"),
                 F.col("fare_amount").cast("double"),
+                F.col("tip_amount").cast("double"),
                 F.col("total_amount").cast("double"),
             )
             .dropna(subset=[
