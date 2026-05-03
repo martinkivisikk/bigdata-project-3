@@ -116,6 +116,7 @@ with DAG(
         response_check=_check_connector_status,
         poke_interval=30,
         timeout=120,
+        soft_fail=True,
     )
 
     # --- Bronze Tasks ---

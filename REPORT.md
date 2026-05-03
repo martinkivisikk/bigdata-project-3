@@ -2,114 +2,89 @@
 
 **Group E** | PostgreSQL CDC → Debezium → Kafka → Iceberg + Taxi Pipeline, orchestrated with Apache Airflow.
 
----
-
 ## 1. CDC Correctness
 
-### Silver Mirrors PostgreSQL
+### PostgreSQL → Silver Current-State Mirror
 
-After a full DAG run the validation task compares Iceberg row counts against live PostgreSQL:
+The CDC path captures changes from PostgreSQL tables `public.customers` and `public.drivers` using Debezium and writes them through Kafka into Iceberg Bronze and Silver tables.
+
+After running `simulate.py` for fresh mutations and triggering the full DAG again, the final validation task compared Silver row counts against PostgreSQL. The simulator was stopped before validation so PostgreSQL would not continue changing during the comparison.
 
 | Table | Silver (Iceberg) | PostgreSQL | Drift |
-|---|---|---|---|
-| `silver_customers` | 172 | 174 | 2 |
-| `silver_drivers` | 51 | 51 | 0 |
+|---|---:|---:|---:|
+| `silver_customers` | 8 | 8 | 0 |
+| `silver_drivers` | 12 | 12 | 0 |
 
-A drift of ≤ 2 on customers is expected: `simulate.py` runs at 1 op/s and a few inserts can land in PostgreSQL after the Kafka batch window closes but before the validation query executes. The validate task tolerates up to 5 rows of drift and raises an exception otherwise.
+The validation task fails if any row-count drift remains.
 
-**Spot checks** — three rows compared directly between `silver_customers` and `SELECT * FROM customers WHERE id IN (6, 7, 30)`:
+### Live CDC Events and Deletes
 
-| id | Silver name | Silver email | Silver country | PG matches? |
-|---|---|---|---|---|
-| 6 | Frank Muller | updated_6_485@example.com | Lithuania | ✓ |
-| 7 | Grace Kim | updated_7_741@inbox.org | Australia | ✓ |
-| 30 | Lena Muller | updated_30_431@test.net | Lithuania | ✓ |
+Bronze CDC stores all Debezium events append-only, including the initial snapshot, live changes, and tombstones.
 
-### DELETE Propagation
+| Table | `r` snapshot | `c` inserts | `u` updates | `d` deletes | Tombstones |
+|---|---:|---:|---:|---:|---:|
+| `bronze_customers` | 10 | 2 | 6 | 4 | 4 |
+| `bronze_drivers` | 8 | 4 | 4 | 0 | 0 |
 
-When PostgreSQL deletes a row (e.g., `DELETE FROM customers WHERE id = 12`), Debezium emits:
-1. A CDC event with `op = 'd'`, `before.id = 12`, `after = NULL`
-2. A tombstone message (null Kafka value) for log compaction
+For deletes, Debezium emits an `op = 'd'` event followed by a null-value tombstone. Bronze stores both. Silver uses the delete event in the MERGE logic:
 
-Both are stored in bronze. The silver MERGE matches on `t.id = s.entity_id` and issues `WHEN MATCHED AND op = 'd' THEN DELETE`. After the run, id 12 is absent from `silver_customers`. Confirmed from notebook output: ids 12, 13, 16, 17, 18, 22, 23 all show `op='d'` in bronze and are absent from silver.
+```sql
+WHEN MATCHED AND s.op = 'd' THEN DELETE
+```
 
-### Idempotency
+Tombstones are ignored by Silver because they have `op IS NULL`. Deleted PostgreSQL rows were confirmed absent from `silver_customers`.
 
-Running the DAG twice with no new changes produces the same silver state:
+### MERGE Idempotency
 
-1. `bronze_cdc` reads Kafka starting from `max(kafka_offset) + 1` per partition (via `starting_offsets()`). With no new Kafka messages, 0 rows are appended.
-2. `silver_cdc` deduplicates the full bronze table with `ROW_NUMBER OVER (PARTITION BY entity_id ORDER BY ts_ms DESC, kafka_offset DESC)` — the same latest row per key is selected on every run.
-3. The MERGE applies the same operations against an already-current silver table:
-   - `MATCHED AND op IN ('c','u','r') → UPDATE` — writes the same values already stored (no change).
-   - `MATCHED AND op = 'd' → DELETE` — row is already absent; the MERGE source row is NOT MATCHED and excluded by `WHEN NOT MATCHED AND op != 'd'`.
-   - `NOT MATCHED AND op != 'd' → INSERT` — row is already present, so the MATCHED branch fires instead.
+`bronze_cdc` reads Kafka from `max(kafka_offset) + 1` per partition, so reruns with no new messages append no duplicate Bronze rows. `silver_cdc` deduplicates Bronze by primary key using the latest `(ts_ms, kafka_offset)` and then applies MERGE:
 
-Re-run result: `silver_customers = 172`, `silver_drivers = 51` — identical to the first run.
+- `op = 'd'` deletes matched rows.
+- `op IN ('c','u','r')` updates matched rows or inserts new ones.
+- Reapplying the same latest state leaves Silver unchanged.
 
----
+Consecutive DAG runs with no new source changes produced the same Silver state and validation passed with zero drift.
 
 ## 2. Lakehouse Design
 
-### Table Schemas
+### CDC Tables
 
-**`cdc.bronze_customers`** (append-only, no deletes):
-```
-kafka_offset LONG, kafka_partition INT, kafka_timestamp TIMESTAMP,
-op STRING, event_type STRING,
-before_id INT, before_name STRING, before_email STRING, before_country STRING,
-after_id INT,  after_name STRING,  after_email STRING,  after_country STRING,
-source_lsn LONG, ts_ms LONG
-```
-Every Debezium event stored verbatim. `event_type = 'tombstone'` for null-value messages; `op` is NULL for tombstones and non-null for real CDC events.
+`cdc.bronze_customers` and `cdc.bronze_drivers` preserve the raw CDC event log: Kafka offset, partition, timestamp, Debezium operation, before/after fields, `source_lsn`, and `ts_ms`. Bronze is append-only and stores tombstones as `event_type = 'tombstone'`.
 
-**`cdc.bronze_drivers`** — same envelope plus:
-```
-before_license_number STRING, before_rating STRING, before_city STRING, before_active BOOLEAN,
-after_license_number  STRING, after_rating  STRING, after_city  STRING, after_active  BOOLEAN
-```
-`rating` kept as raw base64 string (Debezium-encoded `DECIMAL`). Decoded in silver.
+`cdc.silver_customers` stores the current customer state:
 
-**`cdc.silver_customers`** (MERGE target, one row per PK):
-```
-id INT, name STRING, email STRING, country STRING, last_updated_ms BIGINT
+```text
+id, name, email, country, last_updated_ms
 ```
 
-**`cdc.silver_drivers`** (MERGE target):
-```
-id INT, name STRING, license_number STRING, city STRING,
-rating DECIMAL(3,2), last_updated_ms BIGINT
-```
-Rating decoded: `conv(hex(unbase64(after_rating)), 16, 10) / 100.0`.
+`cdc.silver_drivers` stores the current driver state:
 
-**`taxi.bronze_trips`** (append-only):
-```
-key STRING, value STRING, topic STRING, partition INT, offset BIGINT, timestamp TIMESTAMP
-```
-Raw Kafka messages, schema-on-read. Offset tracked per partition for incremental runs.
-
-**`taxi.silver_trips`** (partitioned by `days(tpep_pickup_datetime)`):
-```
-VendorID INT, tpep_pickup_datetime TIMESTAMP, tpep_dropoff_datetime TIMESTAMP,
-passenger_count INT, trip_distance DOUBLE, PULocationID INT, DOLocationID INT,
-fare_amount DOUBLE, total_amount DOUBLE,
-pickup_borough STRING, pickup_zone STRING, pickup_service_zone STRING,
-dropoff_borough STRING, dropoff_zone STRING, dropoff_service_zone STRING
-```
-Invalid trips removed (null timestamps, distance ≤ 0, passenger count outside 1–9, negative fare). Zone names joined from parquet lookup.
-
-**`taxi.gold_route_stats`** (partitioned by `pickup_borough`):
-```
-pickup_borough STRING, dropoff_borough STRING,
-trip_count BIGINT, total_revenue DOUBLE, avg_distance DOUBLE, revenue_per_mile DOUBLE
+```text
+id, name, license_number, city, rating, active, last_updated_ms
 ```
 
-### Why Each Layer Differs
+The `active` field is included because the simulator toggles driver activity status. Driver `rating` is decoded from Debezium’s encoded decimal representation in Silver.
 
-- **Bronze** preserves every event including before/after state and Kafka metadata. Never modified — enables full reprocessing from raw.
-- **Silver** collapses history to current state: one row per entity, tombstones removed, types decoded, deduplication applied. Directly mirrors the source system.
-- **Gold** aggregates silver into business-level metrics; individual rows are discarded in favour of summaries.
+### Taxi Tables
 
-### Iceberg Snapshot History (silver_customers)
+`taxi.bronze_trips` stores raw Kafka taxi JSON events with Kafka metadata:
+
+```text
+key, value, topic, partition, offset, timestamp
+```
+
+`taxi.silver_trips` parses and cleans trips, casts timestamps/numeric fields, removes invalid records, and enriches rows with pickup/dropoff zone names from `taxi_zone_lookup.parquet`. It is partitioned by `days(tpep_pickup_datetime)`.
+
+`taxi.gold_route_stats` aggregates clean Silver trips by `(pickup_borough, dropoff_borough)`:
+
+```text
+trip_count, total_revenue, avg_distance, revenue_per_mile
+```
+
+For the custom scenario, `taxi.silver_trip_custom_scenario` keeps suspicious-but-parseable trips that normal `silver_trips` would remove. The anomaly Gold tables derive from this review table.
+
+### Iceberg Snapshots and Time Travel
+
+Each CDC MERGE creates a new Iceberg snapshot. Snapshot history was inspected with:
 
 ```sql
 SELECT snapshot_id, committed_at, operation
@@ -117,86 +92,123 @@ FROM lakehouse.cdc.silver_customers.snapshots
 ORDER BY committed_at;
 ```
 
-Each MERGE creates an `overwrite` snapshot. After three DAG runs the history shows three distinct snapshots. Snapshot IDs are used for time-travel.
+A previous state can be queried with:
 
-### Time-Travel and Rollback
-
-View state before a specific MERGE:
 ```sql
-SELECT * FROM lakehouse.cdc.silver_customers VERSION AS OF <snapshot_id>;
+SELECT *
+FROM lakehouse.cdc.silver_customers VERSION AS OF <snapshot_id>;
 ```
 
-Roll back a bad MERGE without data loss:
+A bad MERGE can be rolled back with:
+
 ```sql
 CALL lakehouse.system.rollback_to_snapshot('cdc.silver_customers', <snapshot_id>);
 ```
-This updates only the metadata pointer; the data files for the current snapshot remain in MinIO and can be re-applied.
-
----
 
 ## 3. Orchestration Design
 
-### DAG Task Graph
+The whole pipeline is coordinated by one Airflow DAG.
 
-```
-ensure_connector → connector_health ─┬─ bronze_cdc  → silver_cdc  ─────────────┐
-                                      └─ bronze_taxi → silver_taxi → gold_taxi ──┴─→ validate
+```text
+ensure_connector → connector_health ─┬─ bronze_cdc  → silver_cdc ─────────────────────────────┐
+                                      └─ bronze_taxi → silver_taxi ─┬─ gold_taxi ───────────────┤
+                                                                     └─ gold_anomalies ─────────┴─→ validate
 ```
 
 | Task | Purpose |
 |---|---|
-| `ensure_connector` | Idempotent POST to Kafka Connect: creates Debezium connector if absent |
-| `connector_health` | `HttpSensor` polling `GET /connectors/pg-cdc-connector/status` every 30 s (timeout 120 s). Downstream tasks are skipped if this fails |
-| `bronze_cdc` | Spark batch: read new Kafka CDC events since last offset, append to bronze |
-| `bronze_taxi` | Spark batch: read new taxi JSON events since last offset, append to bronze |
-| `silver_cdc` | Dedup + MERGE bronze into silver for customers and drivers |
-| `silver_taxi` | Re-process full bronze into cleaned, zone-enriched silver (overwritePartitions) |
-| `gold_taxi` | Aggregate silver into borough-level route stats (overwritePartitions) |
-| `validate` | Compare Iceberg silver row counts vs PostgreSQL; fail if drift > 5 |
+| `ensure_connector` | Create Debezium connector if missing |
+| `connector_health` | Check Debezium connector status before processing |
+| `bronze_cdc` | Load new CDC Kafka events into Bronze |
+| `silver_cdc` | MERGE CDC Bronze into current-state Silver |
+| `bronze_taxi` | Load new taxi Kafka events into Bronze |
+| `silver_taxi` | Clean/enrich taxi trips and create custom-scenario review Silver |
+| `gold_taxi` | Build route-level taxi aggregation |
+| `gold_anomalies` | Build custom anomaly Gold tables |
+| `validate` | Compare Silver CDC row counts with PostgreSQL |
 
-### Scheduling Strategy
+The DAG runs every 15 minutes, giving a 15-minute freshness SLA for analytics. `max_active_runs=1` prevents overlapping MERGE operations.
 
-`schedule_interval = timedelta(minutes=15)` supports a **15-minute data freshness SLA**. Debezium captures changes within seconds; the 15-minute window covers batch processing, MERGE, and gold aggregation overhead. Sufficient for analytics dashboards that do not require near-real-time updates. `max_active_runs=1` prevents concurrent MERGE races on the silver tables.
-
-### Retry and Failure Handling
+Retries are configured with exponential backoff:
 
 ```python
-default_args = {
-    "retries": 3,
-    "retry_delay": timedelta(minutes=1),
-    "retry_exponential_backoff": True,
-    "max_retry_delay": timedelta(minutes=10),
-    "sla": timedelta(minutes=30),
-}
+retries = 3
+retry_delay = 1 minute
+max_retry_delay = 10 minutes
+sla = 30 minutes
 ```
 
-Retry schedule for a failing task: 1 min → 2 min → 4 min (capped at 10 min). If `connector_health` exhausts its retries (e.g., Kafka Connect is down), all downstream tasks are in `upstream_failed` state and do not run. Once Connect recovers and the DAG is re-triggered, `connector_health` succeeds and the full run proceeds normally.
+If `connector_health` cannot confirm the Debezium connector is running before timeout, the sensor soft-fails and is marked as skipped. Downstream tasks are skipped rather than running against an unhealthy CDC source. Once Connect recovers, the next scheduled or manually triggered run can proceed normally.
 
-**Example failure scenario**: `connect` container restarted mid-run. `connector_health` fails on first poke, retries at T+1 min and T+3 min. After Connect restarts, the sensor detects `RUNNING` and all downstream tasks execute. The `ensure_connector` task re-registers the connector if it was lost during the restart.
+The run history shows multiple consecutive successful full DAG runs, including both manual and scheduled executions. One manual run was triggered after fresh PostgreSQL mutations from `simulate.py`; it completed successfully, and `validate` passed with exact PostgreSQL/Silver row-count equality.
 
-### DAG Run History
+![Airflow successful run history](images/airflow-dag-run-history.png)
 
-Three consecutive successful runs are visible in the Airflow UI (see screenshots). Each run is identified by its `execution_date` at 15-minute intervals. Re-runs for the same interval produce the same silver state (idempotent).
+The graph-view screenshot below shows the full DAG with all tasks visible and completed successfully.
+![Airflow DAG graph success](images/airflow-dag-graph-success.png)
 
-`catchup=False` — missed intervals are not backfilled automatically. Because bronze is offset-based, the next scheduled run reads all messages that accumulated during the missed window, so data is never lost.
 
----
 
 ## 4. Taxi Pipeline
 
-### Bronze → Silver → Gold
+The taxi path continues the Project 2 medallion pipeline, now orchestrated by Airflow:
 
-**Bronze** (`bronze_trips`): raw JSON events appended from Kafka. Incremental — each run reads only messages with `offset > max(offset)` seen in the previous run.
+```text
+produce.py → Kafka taxi-trips → bronze_trips → silver_trips → gold_route_stats
+```
 
-**Silver** (`silver_trips`): invalid trips are removed (null timestamps, `trip_distance ≤ 0`, passenger count outside 1–9, negative fare, `dropoff ≤ pickup`). Zone names are joined via broadcast of the `taxi_zone_lookup.parquet` file. Deduplication by `(VendorID, pickup_datetime, dropoff_datetime, PULocationID, DOLocationID)`. Partitioned by `days(tpep_pickup_datetime)` for efficient time scans.
+Bronze is incremental: `bronze_taxi` computes Kafka `startingOffsets` from the maximum offset already stored in `bronze_trips`, so reruns do not append duplicate events.
 
-**Gold** (`gold_route_stats`): grouped by `(pickup_borough, dropoff_borough)` — `trip_count`, `total_revenue`, `avg_distance`, `revenue_per_mile = total_revenue / total_distance`. Partitioned by `pickup_borough` for borough-filtered queries.
+Silver removes invalid trips, joins zone names, and deduplicates trips by:
 
-### Improvements over Project 2
+```text
+VendorID, pickup timestamp, dropoff timestamp, PULocationID, DOLocationID
+```
 
-todo
----
+Gold aggregates borough-to-borough route statistics.
+
+Improvements over Project 2:
+
+1. The taxi pipeline is now executed by Airflow instead of standalone notebook/streaming jobs.
+2. Bronze ingestion is idempotent through offset-based incremental reads.
+3. The pipeline adds a custom anomaly-analysis branch while keeping the normal cleaned Silver table intact.
+
 
 ## 5. Custom Scenario
 
-todo
+The custom GitHub issue required a `gold_trip_anomalies` table for a fraud review team. A trip is anomalous if any rule applies:
+
+- distance is 0 and fare is greater than $10,
+- duration is below 1 minute and distance is greater than 5 miles,
+- tip is more than 100% of the fare,
+- fare is negative,
+- trip crosses midnight and fare is below $5.
+
+Because normal `silver_trips` removes some of these suspicious records, the implementation adds `silver_trip_custom_scenario`. It parses, casts, and enriches taxi events but preserves suspicious records needed by the anomaly rules.
+
+The custom scenario produces:
+
+| Table | Purpose |
+|---|---|
+| `gold_trip_anomalies` | Flagged trips with triggered rules and severity |
+| `gold_anomaly_summary` | Daily anomaly totals and rule counts |
+| `gold_anomalies_by_zone` | Pickup-zone anomaly concentration |
+
+Severity is based on rule count: 1 = low, 2 = medium, 3+ = high.
+
+After the DAG run:
+
+| Table | Rows |
+|---|---:|
+| `gold_trip_anomalies` | 7 |
+| `gold_anomaly_summary` | 1 |
+| `gold_anomalies_by_zone` | 51 |
+
+Detected rules:
+
+| Rule | Severity | Count |
+|---|---|---:|
+| `negative_fare` | low | 6 |
+| `zero_dist_high_fare` | low | 1 |
+
+The zone query showed anomalies concentrated in several Manhattan pickup zones, including Kips Bay, Midtown Center, East Village, and Lower East Side.
