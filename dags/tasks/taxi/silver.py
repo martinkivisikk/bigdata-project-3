@@ -39,10 +39,28 @@ def silver_taxi(**ctx):
             PARTITIONED BY (days(tpep_pickup_datetime))
         """)
 
-        try:
-            spark.sql("ALTER TABLE lakehouse.taxi.silver_trips ADD COLUMNS (tip_amount DOUBLE)")
-        except Exception:
-            pass  # column already present
+        spark.sql("""
+            CREATE TABLE IF NOT EXISTS lakehouse.taxi.silver_trip_custom_scenario (
+                VendorID              INT,
+                tpep_pickup_datetime  TIMESTAMP,
+                tpep_dropoff_datetime TIMESTAMP,
+                passenger_count       INT,
+                trip_distance         DOUBLE,
+                PULocationID          INT,
+                DOLocationID          INT,
+                fare_amount           DOUBLE,
+                tip_amount            DOUBLE,
+                total_amount          DOUBLE,
+                pickup_borough        STRING,
+                pickup_zone           STRING,
+                pickup_service_zone   STRING,
+                dropoff_borough       STRING,
+                dropoff_zone          STRING,
+                dropoff_service_zone  STRING
+            ) USING iceberg
+            PARTITIONED BY (days(tpep_pickup_datetime))
+        """)
+
 
         schema = StructType([
             StructField("VendorID",              IntegerType()),
@@ -66,6 +84,70 @@ def silver_taxi(**ctx):
             .withColumn("json", F.from_json(F.col("value").cast("string"), schema))
             .select("json.*")
         )
+
+        custom_scenario = (
+            parsed
+            .select(
+                F.col("VendorID").cast("int"),
+                F.col("tpep_pickup_datetime"),
+                F.col("tpep_dropoff_datetime"),
+                F.when(
+                    (F.col("passenger_count").isNull()) | (F.col("passenger_count") <= 0), 1
+                ).otherwise(F.col("passenger_count")).cast("int").alias("passenger_count"),
+                F.col("trip_distance").cast("double"),
+                F.col("PULocationID").cast("int"),
+                F.col("DOLocationID").cast("int"),
+                F.col("fare_amount").cast("double"),
+                F.col("tip_amount").cast("double"),
+                F.col("total_amount").cast("double"),
+            )
+            .dropna(subset=[
+                "tpep_pickup_datetime",
+                "tpep_dropoff_datetime",
+                "PULocationID",
+                "DOLocationID",
+                "trip_distance",
+                "fare_amount",
+            ])
+            .filter(F.col("tpep_dropoff_datetime") > F.col("tpep_pickup_datetime"))
+            .join(F.broadcast(pu), F.col("PULocationID") == F.col("pu.LocationID"), "left")
+            .join(F.broadcast(do), F.col("DOLocationID") == F.col("do.LocationID"), "left")
+            .select(
+                "VendorID",
+                "tpep_pickup_datetime",
+                "tpep_dropoff_datetime",
+                "passenger_count",
+                "trip_distance",
+                "PULocationID",
+                "DOLocationID",
+                "fare_amount",
+                "tip_amount",
+                "total_amount",
+                F.col("pu.Borough").alias("pickup_borough"),
+                F.col("pu.Zone").alias("pickup_zone"),
+                F.col("pu.service_zone").alias("pickup_service_zone"),
+                F.col("do.Borough").alias("dropoff_borough"),
+                F.col("do.Zone").alias("dropoff_zone"),
+                F.col("do.service_zone").alias("dropoff_service_zone"),
+            )
+            .filter(F.col("pickup_zone").isNotNull() & F.col("dropoff_zone").isNotNull())
+            .dropDuplicates([
+                "VendorID",
+                "tpep_pickup_datetime",
+                "tpep_dropoff_datetime",
+                "PULocationID",
+                "DOLocationID",
+                "fare_amount",
+                "trip_distance",
+            ])
+        )
+
+        custom_scenario.writeTo("lakehouse.taxi.silver_trip_custom_scenario").overwritePartitions()
+        
+        review_n = spark.sql(
+            "SELECT count(*) AS n FROM lakehouse.taxi.silver_trip_custom_scenario"
+        ).collect()[0]["n"]
+        log.info("silver_trip_custom_scenario: %d rows after overwrite", review_n)
 
         transformed = (
             parsed

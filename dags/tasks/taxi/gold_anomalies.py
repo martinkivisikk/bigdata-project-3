@@ -48,8 +48,23 @@ def gold_taxi_anomalies():
             ) USING iceberg
             PARTITIONED BY (trip_date)
         """)
+        spark.sql("""
+            CREATE TABLE IF NOT EXISTS lakehouse.taxi.gold_anomalies_by_zone (
+                pickup_borough          STRING,
+                pickup_zone             STRING,
+                total_trips             BIGINT,
+                total_anomalies         BIGINT,
+                anomaly_rate_pct        DOUBLE,
+                n_zero_dist_high_fare   BIGINT,
+                n_impossible_speed      BIGINT,
+                n_tip_exceeds_fare      BIGINT,
+                n_negative_fare         BIGINT,
+                n_midnight_cheap        BIGINT
+            ) USING iceberg
+            PARTITIONED BY (pickup_borough)
+        """)
 
-        silver = spark.table("lakehouse.taxi.silver_trips")
+        silver = spark.table("lakehouse.taxi.silver_trip_custom_scenario")
 
         flagged = (
             silver
@@ -121,9 +136,44 @@ def gold_taxi_anomalies():
 
         summary.writeTo("lakehouse.taxi.gold_anomaly_summary").overwritePartitions()
 
+        zone_summary = (
+            flagged
+            .groupBy("pickup_borough", "pickup_zone")
+            .agg(
+                F.count("*").alias("total_trips"),
+                F.sum(F.when(F.col("rule_count") > 0, 1).otherwise(0)).alias("total_anomalies"),
+                F.sum("is_zero_dist_high_fare").alias("n_zero_dist_high_fare"),
+                F.sum("is_impossible_speed").alias("n_impossible_speed"),
+                F.sum("is_tip_exceeds_fare").alias("n_tip_exceeds_fare"),
+                F.sum("is_negative_fare").alias("n_negative_fare"),
+                F.sum("is_midnight_cheap").alias("n_midnight_cheap"),
+            )
+            .withColumn(
+                "anomaly_rate_pct",
+                F.round(F.col("total_anomalies") / F.col("total_trips") * 100, 2)
+            )
+            .select(
+                "pickup_borough",
+                "pickup_zone",
+                "total_trips",
+                "total_anomalies",
+                "anomaly_rate_pct",
+                "n_zero_dist_high_fare",
+                "n_impossible_speed",
+                "n_tip_exceeds_fare",
+                "n_negative_fare",
+                "n_midnight_cheap",
+            )
+        )
+
+        zone_summary.writeTo("lakehouse.taxi.gold_anomalies_by_zone").overwritePartitions()
+
         n_trips = spark.sql("SELECT count(*) AS n FROM lakehouse.taxi.gold_trip_anomalies").collect()[0]["n"]
         n_days  = spark.sql("SELECT count(*) AS n FROM lakehouse.taxi.gold_anomaly_summary").collect()[0]["n"]
+        n_zones = spark.sql("SELECT count(*) AS n FROM lakehouse.taxi.gold_anomalies_by_zone").collect()[0]["n"]
         log.info("gold_trip_anomalies: %d flagged trips", n_trips)
         log.info("gold_anomaly_summary: %d days", n_days)
+        log.info("gold_anomalies_by_zone: %d pickup zones", n_zones)
+
     finally:
         spark.stop()
