@@ -68,9 +68,18 @@ def silver_cdc(**ctx):
                 license_number   STRING,
                 city             STRING,
                 rating           DECIMAL(3,2),
+                active           BOOLEAN,
                 last_updated_ms  BIGINT
             ) USING iceberg
         """)
+
+        driver_columns = [
+            row["col_name"]
+            for row in spark.sql("DESCRIBE lakehouse.cdc.silver_drivers").collect()
+        ]
+    
+        if "active" not in driver_columns:
+            spark.sql("ALTER TABLE lakehouse.cdc.silver_drivers ADD COLUMNS (active BOOLEAN)")
 
         bronze_drv = spark.table("lakehouse.cdc.bronze_drivers")
         deduped_drv = (
@@ -102,11 +111,12 @@ def silver_cdc(**ctx):
                 t.license_number  = s.after_license_number,
                 t.city            = s.after_city,
                 t.rating          = s.rating,
+                t.active          = s.after_active,
                 t.last_updated_ms = s.ts_ms
             WHEN NOT MATCHED AND s.op != 'd' THEN INSERT
-                (id, name, license_number, city, rating, last_updated_ms)
+                (id, name, license_number, city, rating, active, last_updated_ms)
                 VALUES (s.after_id, s.after_name, s.after_license_number,
-                        s.after_city, s.rating, s.ts_ms)
+                        s.after_city, s.rating, s.after_active, s.ts_ms)
         """)
         sd = spark.sql("SELECT count(*) AS n FROM lakehouse.cdc.silver_drivers").collect()[0]["n"]
         log.info("silver_drivers: %d rows after MERGE", sd)
