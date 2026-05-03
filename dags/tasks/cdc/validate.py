@@ -30,9 +30,9 @@ def validate(**ctx):
             )
 
         max_drift = max(r[3] for r in results)
-        if max_drift > 5:
+        if max_drift != 0:
             raise ValueError(
-                f"Row drift too large ({max_drift} > 5). "
+                f"CDC validation failed: Silver row counts don't match PostgreSQL. "
                 f"Details: {results}"
             )
         log.info("Validation passed — max drift = %d (<= 5)", max_drift)
